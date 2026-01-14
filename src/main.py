@@ -14,7 +14,6 @@ from threading import Thread, Lock
 import logging
 import time
 import queue
-import queue
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -216,17 +215,17 @@ def main():
     vision_system = VisionSystem()
     vision_system.load_models()
 
-    # Initialize the 3D viewer
-    logging.info("Initializing 3D viewer...")
-    viewer = RealTime3DViewer()
-    # No longer need to call viewer.start() as BackgroundPlotter is now used
-
     # Initialize camera
     logging.info(f"Initializing camera at index {config.CAMERA_INDEX}...")
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
     if not cap.isOpened():
         logging.error("Cannot open camera")
         return
+
+    # Initialize the 3D viewer
+    logging.info("Initializing 3D viewer...")
+    viewer = RealTime3DViewer()
+    # No longer need to call viewer.start() as BackgroundPlotter is now used
 
     # Camera intrinsic parameters
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
