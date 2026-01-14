@@ -11,6 +11,7 @@ import pyvista as pv
 from threading import Thread, Lock
 import logging
 import time
+import queue
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -99,6 +100,9 @@ class VisionSystem:
         self.yolo = None
         self.depth_model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Vision system operating on device: {self.device}")
+        self.cached_grid = None
+        self.cached_shape = None
 
     def load_models(self):
         # Load YOLO model
@@ -167,14 +171,22 @@ class VisionSystem:
 
     def create_3d_points_from_depth(self, frame, depth_map, camera_matrix):
         height, width = depth_map.shape
-        if frame.shape[:2] != (height, width):
-            depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
-            height, width = depth_map.shape
+        
+        # Only compute meshgrid if shape changes
+        if self.cached_grid is None or self.cached_shape != (height, width):
+            self.cached_shape = (height, width)
+            u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+            self.cached_u = u_coords.flatten()
+            self.cached_v = v_coords.flatten()
+            self.cached_grid = True # Mark cache as built
+            
+        # Use cached values
         depth_valid = 1.0 / (depth_map.flatten() + 0.001)
         valid_mask = (depth_valid < 1000) & (depth_valid > 0.1)
-        u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
-        u_flat = u_coords.flatten()[valid_mask]
-        v_flat = v_coords.flatten()[valid_mask]
+        
+        u_flat = self.cached_u[valid_mask]
+        v_flat = self.cached_v[valid_mask]
+        
         z_3d = depth_valid[valid_mask] * config.DEPTH_SCALE
         fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
         cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
@@ -185,6 +197,39 @@ class VisionSystem:
         colors = color_flat[valid_mask]
         colors = colors[:, [2, 1, 0]]
         return points_3d, colors
+
+# Shared queue for the latest frame
+latest_frame_queue = queue.Queue(maxsize=1)
+
+def processing_thread(vision_system, viewer, camera_matrix):
+    """
+    This thread function grabs frames from the queue, performs heavy AI processing,
+    and updates the 3D viewer.
+    """
+    while True:
+        try:
+            # Get the latest frame, waiting if the queue is empty
+            frame = latest_frame_queue.get()
+            if frame is None:  # Sentinel value to stop the thread
+                break
+
+            # --- Heavy Lifting Here ---
+            depth_map = vision_system.get_depth_map(frame)
+            detections, points_3d, colors = vision_system.process_frame(frame, depth_map, camera_matrix)
+
+            # Update 3D Viewer
+            if len(points_3d) > 0:
+                # Downsample if necessary to maintain performance
+                if len(points_3d) > 5000:
+                    step = len(points_3d) // 5000
+                    points_3d = points_3d[::step]
+                    colors = colors[::step]
+                viewer.update_and_render(points_3d, colors)
+        except queue.Empty:
+            continue # Loop again if the queue was empty
+        except Exception as e:
+            logging.error(f"Error in processing thread: {e}")
+
 
 def main():
     # Initialize the vision system
@@ -216,6 +261,11 @@ def main():
         [0, 0, 1]
     ])
 
+    logging.info("Starting processing thread...")
+    process_thread = Thread(target=processing_thread, args=(vision_system, viewer, camera_matrix))
+    process_thread.daemon = True
+    process_thread.start()
+
     logging.info("Press 'q' in the camera window to quit")
 
     try:
@@ -224,30 +274,40 @@ def main():
             if not ret:
                 break
 
-            # Get depth map
-            depth_map = vision_system.get_depth_map(frame)
-
-            # Process frame
-            detections, points_3d, colors = vision_system.process_frame(frame, depth_map, camera_matrix)
-
-            # Update the 3D viewer
-            if len(points_3d) > 0:
-                if len(points_3d) > 5000:
-                    step = len(points_3d) // 5000
-                    points_3d = points_3d[::step]
-                    colors = colors[::step]
-                viewer.update_and_render(points_3d, colors)
-
-            # Show the original frame
+            # 1. SHOW 2D IMMEDIATELY (Real-time!)
             cv2.imshow('Camera Feed', frame)
+
+            # 2. Send frame to AI thread (Non-blocking)
+            # If queue is full, it means the AI is still working on the previous frame.
+            # We empty the queue and put the new frame, ensuring the AI always gets the latest data.
+            if latest_frame_queue.full():
+                try:
+                    # Non-blocking get to remove the old frame
+                    latest_frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            
+            try:
+                 # Non-blocking put to add the new frame
+                latest_frame_queue.put_nowait(frame)
+            except queue.Full:
+                pass
+
 
             # Break on 'q' key press
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
+        logging.info("Cleaning up...")
+        # Stop the processing thread
+        latest_frame_queue.put(None)
+        process_thread.join()
+
+        # Release resources
         cap.release()
         cv2.destroyAllWindows()
         viewer.stop()
+        logging.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
