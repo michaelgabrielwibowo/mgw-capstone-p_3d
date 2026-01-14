@@ -148,33 +148,52 @@ class VisionSystem:
 # Shared queue
 latest_frame_queue = queue.Queue(maxsize=1)
 
+# --- ADD THIS IMPORT AT THE TOP ---
+try:
+    from diy_fusion import DIYFusionSystem
+except ImportError:
+    from src.diy_fusion import DIYFusionSystem
+
+# --- REPLACE THE ENTIRE processing_thread FUNCTION ---
 def processing_thread(vision_system, viewer, camera_matrix):
-    # Initialize the DIY Fusion System
+    """
+    Updated processing thread that uses DIYFusionSystem to build a persistent world.
+    """
     logging.info("Initializing DIY Fusion System...")
-    fusion_system = DIYFusionSystem(voxel_size=0.05) # 5cm resolution
+    # 1. Initialize the Fusion System (The "Memory")
+    # voxel_size=0.05 means 5cm blocks. 
+    fusion_system = DIYFusionSystem(voxel_size=0.05) 
 
     while True:
         try:
             frame = latest_frame_queue.get()
             if frame is None: break
 
-            # 1. AI Inference
+            # 2. AI Inference
             depth_map = vision_system.get_depth_map(frame)
             
-            # 2. Get Local 3D Points (The "Pin Art")
-            points_3d, colors = vision_system.get_3d_points(frame, depth_map, camera_matrix)
+            # 3. Get Local 3D Points (The "Pin Art" for this specific frame)
+            # We ignore 'detections' here as we just want the raw cloud
+            _, points_3d, colors = vision_system.process_frame(frame, depth_map, camera_matrix)
 
-            # 3. Fuse into Global World (The "Sculpture")
+            # 4. FUSE into Global World
+            # This takes the new frame and "glues" it to the existing world
             if len(points_3d) > 0:
                 global_pts, global_cols = fusion_system.process_frame(points_3d, colors, frame, camera_matrix)
                 
-                # 4. Render Global World
-                viewer.update_and_render(global_pts, global_cols)
+                # 5. Render the Global World (not just the current frame)
+                # We limit to 500,000 points to keep the viewer smooth
+                if len(global_pts) > 500000:
+                    # Simple random downsample if it gets too huge
+                    indices = np.random.choice(len(global_pts), 500000, replace=False)
+                    viewer.update_and_render(global_pts[indices], global_cols[indices])
+                else:
+                    viewer.update_and_render(global_pts, global_cols)
 
         except queue.Empty:
             continue
         except Exception as e:
-            logging.error(f"Error in processing: {e}")
+            logging.error(f"Error in processing thread: {e}")
 
 def main():
     logging.info("Starting System...")
