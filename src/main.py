@@ -151,7 +151,7 @@ latest_frame_queue = queue.Queue(maxsize=1)
 def processing_thread(vision_system, viewer, camera_matrix):
     # Initialize the DIY Fusion System
     logging.info("Initializing DIY Fusion System...")
-    fusion_system = DIYFusionSystem(voxel_size=2.0) # Adjust voxel_size based on your scale (try 0.1 to 5.0)
+    fusion_system = DIYFusionSystem(voxel_size=0.05) # 5cm resolution
 
     while True:
         try:
