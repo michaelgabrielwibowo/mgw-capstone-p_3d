@@ -28,14 +28,20 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 pv.global_theme.allow_empty_mesh = True
 
+import datetime
+
 class RealTime3DViewer:
     def __init__(self, title="Real-time 3D Reconstruction"):
         self.plotter = BackgroundPlotter(title=title, auto_update=True)
         self.plotter.add_axes()
         self.actor_name = 'global_cloud'
+        self._last_poly_data = pv.PolyData()
         
         # Initialize with a small dummy point to prevent PyVista warnings
-        self.plotter.add_mesh(pv.PolyData(np.array([[0.,0.,0.]])), name=self.actor_name)
+        self.plotter.add_mesh(self._last_poly_data, name=self.actor_name)
+        
+        # Add a key press event for 's' to save the point cloud
+        self.plotter.add_key_event('s', self.save_point_cloud)
 
     def update_and_render(self, points, colors=None):
         if points is None or len(points) == 0:
@@ -48,17 +54,27 @@ class RealTime3DViewer:
             colors = np.full((points.shape[0], 3), [255, 255, 255], dtype=np.uint8)
 
         # Update the existing mesh
-        poly_data = pv.PolyData(points)
-        poly_data['colors'] = colors
+        self._last_poly_data = pv.PolyData(points)
+        self._last_poly_data['colors'] = colors
         
         self.plotter.add_mesh(
-            poly_data,
+            self._last_poly_data,
             name=self.actor_name,
             scalars='colors',
             rgb=True,
             point_size=3.0, # Smaller points look better for dense clouds
             render_points_as_spheres=True,
         )
+
+    def save_point_cloud(self):
+        """Saves the current point cloud to a PLY file with a timestamp."""
+        if self._last_poly_data.n_points > 0:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"reconstruction_{timestamp}.ply"
+            self._last_poly_data.save(filename)
+            logging.info(f"Point cloud saved to {filename}")
+        else:
+            logging.warning("No point cloud to save.")
 
     def stop(self):
         self.plotter.close()
