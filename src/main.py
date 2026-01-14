@@ -174,7 +174,7 @@ def processing_thread(vision_system, viewer, camera_matrix):
             
             # 3. Get Local 3D Points (The "Pin Art" for this specific frame)
             # We ignore 'detections' here as we just want the raw cloud
-            _, points_3d, colors = vision_system.process_frame(frame, depth_map, camera_matrix)
+            points_3d, colors = vision_system.get_3d_points(frame, depth_map, camera_matrix)
 
             # 4. FUSE into Global World
             # This takes the new frame and "glues" it to the existing world
