@@ -1,0 +1,29 @@
+"""
+Simple startup script for the 3D reconstruction project
+"""
+
+print("3D Vision System - Startup Guide")
+print("="*55)
+
+print("\nPrerequisites:")
+print("1. Make sure you have a working webcam.")
+
+print("\nTo run the 3D reconstruction system:")
+print("1. Open a terminal/command prompt")
+print("2. Navigate to the capstone_project directory")
+print("3. Install the required dependencies: pip install -r requirements.txt")
+print("4. Download the required models:")
+print("   python download_model.py")
+print("   python download_depth_anything_v2.py")
+print("5. Run the main script: python main.py")
+print("6. Point your camera at objects to see 3D reconstruction with object detection overlays.")
+
+print("\nNote: The 3D reconstruction works by combining:")
+print("- YOLO for object detection")
+print("- Depth Anything V2 for depth estimation")
+print("- PyVista for 3D visualization")
+print("- Real-time camera feed processing")
+
+print("\nThe system will create 3D point cloud representations of objects in your camera view.")
+print("When you point your camera at a phone, for example, you'll see a 3D reconstruction")
+print("based on the depth information estimated from the single 2D camera image.")

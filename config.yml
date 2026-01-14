@@ -1,0 +1,15 @@
+# Configuration for the 3D vision system
+
+# -- Model Paths --
+YOLO_MODEL_PATH: "models/yolov8n.onnx"
+DEPTH_MODEL_PATH: "models/depth_anything_v2_vits.pth"
+
+# -- 3D Reconstruction --
+FOCAL_LENGTH: 700
+DEPTH_SCALE: 100.0
+
+# -- n8n Integration --
+N8N_WEBHOOK_URL: "http://localhost:5678/webhook/vision-detections"
+
+# -- Camera --
+CAMERA_INDEX: 0
