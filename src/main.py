@@ -8,9 +8,12 @@ import json
 import sys
 import os
 import pyvista as pv
+pv.global_theme.allow_empty_mesh = True
+from pyvistaqt import BackgroundPlotter
 from threading import Thread, Lock
 import logging
 import time
+import queue
 import queue
 
 # Configure logging
@@ -19,81 +22,57 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 import src.config as config
 
 class RealTime3DViewer:
+    """
+    A thread-safe viewer that uses pyvista.BackgroundPlotter to display a
+    point cloud that can be updated from an external thread.
+    """
     def __init__(self, title="Real-time 3D Point Cloud Viewer"):
         self.title = title
-        self.plotter = None
-        self.point_cloud_actor = None
-        self.points = np.zeros((0, 3))
-        self.colors = np.zeros((0, 3))
-        self.lock = Lock()
-        self.running = False
-        self.update_needed = False
-
-    def initialize_plotter(self):
-        self.plotter = pv.Plotter(notebook=False, title=self.title)
+        # BackgroundPlotter handles its own window, thread, and updates.
+        self.plotter = BackgroundPlotter(title=self.title, auto_update=True)
         self.plotter.add_axes()
-        initial_points = pv.PolyData(np.zeros((1, 3)))
-        initial_points['colors'] = np.array([[255, 255, 255]])
-        self.point_cloud_actor = self.plotter.add_points(
-            initial_points,
+        # Name for our actor to reference it for updates
+        self.actor_name = 'point_cloud'
+        # Add an initial empty point cloud
+        self.plotter.add_mesh(pv.PolyData(), name=self.actor_name)
+
+    def update_and_render(self, points, colors=None):
+        """
+        Updates the point cloud mesh in the plotter. This method is thread-safe
+        as BackgroundPlotter is designed for this purpose.
+        """
+        if points is None or len(points) == 0:
+            return
+            
+        if colors is not None:
+            if colors.dtype != np.uint8:
+                colors = (colors * 255).astype(np.uint8)
+        else:
+            # Default to white if no colors are provided
+            colors = np.full((points.shape[0], 3), [255, 255, 255], dtype=np.uint8)
+
+        poly_data = pv.PolyData(points)
+        poly_data['colors'] = colors
+        
+        # Re-add the mesh with the same name to update it
+        self.plotter.add_mesh(
+            poly_data,
+            name=self.actor_name,
             scalars='colors',
             rgb=True,
             point_size=5.0,
-            render_points_as_spheres=True
+            render_points_as_spheres=True,
         )
 
-    def update_point_cloud(self, points, colors=None):
-        with self.lock:
-            self.points = points.copy()
-            if colors is not None:
-                if colors.dtype != np.uint8:
-                    colors = (colors * 255).astype(np.uint8)
-                self.colors = colors.copy()
-            else:
-                self.colors = np.full_like(points, [255, 255, 255], dtype=np.uint8)
-            self.update_needed = True
-
-    def update_scene(self):
-        if not self.update_needed:
-            return
-        with self.lock:
-            if len(self.points) > 0:
-                poly_data = pv.PolyData(self.points)
-                if len(self.colors) > 0:
-                    if self.colors.shape[1] == 3:
-                        poly_data['colors'] = self.colors
-                    else:
-                        poly_data['colors'] = np.full_like(self.points, [255, 255, 255], dtype=np.uint8)
-                else:
-                    poly_data['colors'] = np.full_like(self.points, [255, 255, 255], dtype=np.uint8)
-                self.point_cloud_actor.GetMapper().SetInputData(poly_data)
-                self.point_cloud_actor.GetMapper().SetColorModeToDirectScalars()
-                self.point_cloud_actor.GetProperty().SetPointSize(5.0)
-                self.update_needed = False
-
-    def start(self):
-        if self.plotter is None:
-            self.initialize_plotter()
-        self.running = True
-        def plotting_thread():
-            self.plotter.show()
-        self.plot_thread = Thread(target=plotting_thread, daemon=True)
-        self.plot_thread.start()
-        time.sleep(0.5)
-
-    def update_and_render(self, points, colors=None):
-        self.update_point_cloud(points, colors)
-        self.update_scene()
-        if self.plotter is not None:
-            self.plotter.render()
-
     def stop(self):
-        self.running = False
-        if self.plotter is not None:
-            self.plotter.close()
+        """ Closes the plotter window. """
+        self.plotter.close()
 
     def is_active(self):
-        return self.running and self.plotter is not None
+        """ Checks if the plotter is running. """
+        # BackgroundPlotter manages its own window state.
+        # We assume it's active until stop() is called.
+        return self.plotter is not None
 
 class VisionSystem:
     def __init__(self):
@@ -114,7 +93,7 @@ class VisionSystem:
             sys.exit(1)
 
         # Load Depth Anything V2 model
-        from dpt import DepthAnythingV2
+        from src.depth_anything_v2.depth_anything_v2.dpt import DepthAnythingV2
         self.depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
         if os.path.exists(config.DEPTH_MODEL_PATH):
             logging.info(f"Loading Depth Anything V2 model from {config.DEPTH_MODEL_PATH}")
@@ -240,7 +219,7 @@ def main():
     # Initialize the 3D viewer
     logging.info("Initializing 3D viewer...")
     viewer = RealTime3DViewer()
-    viewer.start()
+    # No longer need to call viewer.start() as BackgroundPlotter is now used
 
     # Initialize camera
     logging.info(f"Initializing camera at index {config.CAMERA_INDEX}...")
