@@ -12,6 +12,8 @@ with open(os.path.join(PROJECT_ROOT, 'config.yml'), 'r') as f:
 # -- Model Paths --
 YOLO_MODEL_PATH = os.path.join(PROJECT_ROOT, config['YOLO_MODEL_PATH'])
 DEPTH_MODEL_PATH = os.path.join(PROJECT_ROOT, config['DEPTH_MODEL_PATH'])
+SAM_MODEL_PATH = os.path.join(PROJECT_ROOT, config['SAM_MODEL_PATH'])
+SAM_MODEL_TYPE = config['SAM_MODEL_TYPE']
 
 # -- 3D Reconstruction --
 FOCAL_LENGTH = config['FOCAL_LENGTH']

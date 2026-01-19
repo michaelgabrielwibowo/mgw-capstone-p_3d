@@ -11,18 +11,14 @@ import logging
 import queue
 import time
 
-# -- FIXED IMPORTS --
-# We assume we are running this script from the project root or src folder.
-# This fixes the "Import src.config could not be resolved" error.
-try:
-    import config
-    from diy_fusion import DIYFusionSystem
-    from depth_anything_v2.depth_anything_v2.dpt import DepthAnythingV2
-except ImportError:
-    # Fallback if running from root directory without -m
-    import src.config as config
-    from src.diy_fusion import DIYFusionSystem
-    from src.depth_anything_v2.depth_anything_v2.dpt import DepthAnythingV2
+# Direct imports - run this script from the src directory or use 'python -m src.main' from root
+import config
+from diy_fusion import DIYFusionSystem
+from object_fusion import ObjectCentricFusion  # Legacy fallback
+from delta_fusion import DeltaFusionSystem  # New delta-compression system
+from depth_anything_v2.depth_anything_v2.dpt import DepthAnythingV2
+from sam_segmenter import SAMSegmenter
+from ui_overlay import UIOverlay
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -67,6 +63,7 @@ class VisionSystem:
     def __init__(self):
         self.yolo = None
         self.depth_model = None
+        self.sam = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logging.info(f"Vision system operating on device: {self.device}")
         self.cached_grid = None
@@ -90,6 +87,55 @@ class VisionSystem:
             logging.error(f"Depth model missing at {config.DEPTH_MODEL_PATH}")
             sys.exit(1)
         self.depth_model = self.depth_model.to(self.device).eval()
+
+        # Load SAM (Segment Anything Model)
+        if os.path.exists(config.SAM_MODEL_PATH):
+            logging.info(f"Loading SAM from {config.SAM_MODEL_PATH}")
+            self.sam = SAMSegmenter(model_type=config.SAM_MODEL_TYPE, device=str(self.device))
+            self.sam.load_model(config.SAM_MODEL_PATH)
+        else:
+            logging.warning(f"SAM model missing at {config.SAM_MODEL_PATH} - running without segmentation")
+
+    def detect_and_segment(self, frame):
+        """
+        Detect objects with YOLO and segment with SAM.
+        
+        Returns:
+            List of tuples: (mask, label, confidence, bbox) for each detected object
+        """
+        # Convert BGR to RGB for SAM
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Run YOLO detection
+        results = self.yolo(frame, verbose=False)[0]
+        boxes = results.boxes.xyxy.cpu().numpy()
+        labels = results.boxes.cls.cpu().numpy().astype(int)
+        scores = results.boxes.conf.cpu().numpy()
+        names = results.names  # Class name mapping
+        
+        if len(boxes) == 0:
+            return []
+        
+        # Get SAM masks for each detection
+        if self.sam is not None:
+            masks = self.sam.get_masks_for_detections(rgb_frame, boxes)
+        else:
+            # Fallback: use bounding box as rectangular mask
+            masks = []
+            h, w = frame.shape[:2]
+            for box in boxes:
+                mask = np.zeros((h, w), dtype=bool)
+                x1, y1, x2, y2 = map(int, box)
+                mask[y1:y2, x1:x2] = True
+                masks.append(mask)
+        
+        detections = []
+        for i in range(len(boxes)):
+            label_name = names[labels[i]]
+            detections.append((masks[i], label_name, scores[i], boxes[i]))
+            logging.debug(f"Detected: {label_name} ({scores[i]:.2f})")
+        
+        return detections
 
     def get_depth_map(self, frame):
         with torch.no_grad():
@@ -145,36 +191,141 @@ class VisionSystem:
         
         return points_3d, colors
 
+    def get_3d_points_masked(self, frame, depth_map, mask, camera_matrix):
+        """
+        Converts 2D Image + Depth Map -> 3D Point Cloud (ONLY for masked region)
+        
+        Args:
+            frame: BGR image
+            depth_map: Depth values for each pixel
+            mask: Binary mask (H, W) where True = include pixel
+            camera_matrix: Camera intrinsics
+            
+        Returns:
+            points_3d: (N, 3) array of 3D points
+            colors: (N, 3) array of RGB colors
+        """
+        height, width = depth_map.shape
+        
+        # Create coordinate grids
+        u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+        u_flat = u_coords.flatten()
+        v_flat = v_coords.flatten()
+        
+        # Flatten mask and depth
+        mask_flat = mask.flatten()
+        depth_flat = depth_map.flatten()
+        
+        # Combined validity: inside mask AND valid depth
+        valid = mask_flat & (depth_flat > 0)
+        
+        if not np.any(valid):
+            return np.empty((0, 3)), np.empty((0, 3))
+        
+        # Get valid coordinates and depth
+        z_3d = depth_flat[valid] * (config.DEPTH_SCALE / 50.0)
+        u_valid = u_flat[valid]
+        v_valid = v_flat[valid]
+        
+        # Camera intrinsics
+        fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
+        cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
+        
+        # Project to 3D
+        x_3d = (u_valid - cx) * z_3d / fx
+        y_3d = (v_valid - cy) * z_3d / fy
+        
+        points_3d = np.stack([x_3d, z_3d, y_3d], axis=-1)
+        
+        # Get Colors
+        color_flat = frame.reshape(-1, 3)
+        colors = color_flat[valid]
+        colors = colors[:, [2, 1, 0]]  # BGR to RGB
+        
+        # Performance optimization: subsample if too many points
+        max_points = 2000  # Per object
+        if len(points_3d) > max_points:
+            step = len(points_3d) // max_points
+            return points_3d[::step], colors[::step]
+        
+        return points_3d, colors
+
 # Shared queue
 latest_frame_queue = queue.Queue(maxsize=1)
 
 def processing_thread(vision_system, viewer, camera_matrix):
-    # Initialize the DIY Fusion System
-    logging.info("Initializing DIY Fusion System...")
-    fusion_system = DIYFusionSystem(voxel_size=2.0) # Adjust voxel_size based on your scale (try 0.1 to 5.0)
+    # Initialize the Delta Fusion System (video-compression-style updates)
+    logging.info("Initializing Delta Fusion System (Performance Mode)...")
+    fusion_system = DeltaFusionSystem(
+        voxel_size=2.5,           # LARGER = fewer points, faster rendering
+        max_objects=20,           # Reduced for performance
+        expire_after_frames=45,   # Faster object cleanup
+        keyframe_interval=20,     # More responsive keyframes
+        stale_voxel_age=60        # Faster stale voxel cleanup
+    )
+    
+    frame_count = 0
+    start_time = time.time()
+    
+    # Performance: Skip SAM on some frames (heavy operation)
+    SAM_SKIP_FRAMES = 3  # Run SAM every 3rd frame
+    cached_detections = []
+    cached_depth_map = None
 
     while True:
         try:
             frame = latest_frame_queue.get()
             if frame is None: break
-
-            # 1. AI Inference
-            depth_map = vision_system.get_depth_map(frame)
             
-            # 2. Get Local 3D Points (The "Pin Art")
-            points_3d, colors = vision_system.get_3d_points(frame, depth_map, camera_matrix)
-
-            # 3. Fuse into Global World (The "Sculpture")
-            if len(points_3d) > 0:
-                global_pts, global_cols = fusion_system.process_frame(points_3d, colors, frame, camera_matrix)
+            frame_count += 1
+            
+            # Performance optimization: Only run SAM every N frames
+            run_full_detection = (frame_count % SAM_SKIP_FRAMES == 0) or len(cached_detections) == 0
+            
+            if run_full_detection:
+                # 1. Detect and segment objects (heavy - SAM)
+                detections = vision_system.detect_and_segment(frame)
+                cached_detections = detections
                 
-                # 4. Render Global World
+                # 2. Get depth map
+                depth_map = vision_system.get_depth_map(frame)
+                cached_depth_map = depth_map
+            else:
+                # Use cached detections, but update depth map (it's fast)
+                detections = cached_detections
+                depth_map = vision_system.get_depth_map(frame)
+            
+            # 3. Get 3D points for each detected object
+            points_per_detection = []
+            for mask, label, score, bbox in detections:
+                if score < 0.5:
+                    points_per_detection.append((np.empty((0,3)), np.empty((0,3))))
+                    continue
+                pts, cols = vision_system.get_3d_points_masked(frame, depth_map, mask, camera_matrix)
+                points_per_detection.append((pts, cols))
+            
+            # 4. Process through delta fusion
+            global_pts, global_cols = fusion_system.process_frame(
+                frame, detections, points_per_detection, camera_matrix
+            )
+            
+            # 5. Render 3D view (skip some frames for smoother UI)
+            if len(global_pts) > 0 and frame_count % 2 == 0:  # Render every 2nd frame
                 viewer.update_and_render(global_pts, global_cols)
+            
+            # Log performance
+            if frame_count % 30 == 0:  # Less frequent logging
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed
+                stats = fusion_system.get_stats()
+                logging.info(f"FPS: {fps:.2f} | Objects: {stats['object_count']} | Voxels: {stats['total_voxels']}")
 
         except queue.Empty:
             continue
         except Exception as e:
             logging.error(f"Error in processing: {e}")
+            import traceback
+            traceback.print_exc()
 
 def main():
     logging.info("Starting System...")
@@ -187,6 +338,7 @@ def main():
         return
 
     viewer = RealTime3DViewer()
+    ui = UIOverlay()
 
     # Setup Camera Matrix (Intrinsics)
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -200,22 +352,106 @@ def main():
     proc_thread.daemon = True
     proc_thread.start()
 
-    logging.info("Press 'q' to quit.")
+    # UI state
+    show_masks = True
+    show_labels = True
+    show_bboxes = True
+    show_help = True
+    current_detections = []
+
+    # Mouse callback for add-object mode
+    def mouse_callback(event, x, y, flags, param):
+        ui.handle_mouse_event(event, x, y, flags)
+    
+    cv2.namedWindow('Object Detection (2D)')
+    cv2.setMouseCallback('Object Detection (2D)', mouse_callback)
+
+    logging.info("Press 'H' for help, 'Q' to quit.")
     try:
         while True:
             ret, frame = cap.read()
             if not ret: break
 
-            cv2.imshow('Camera Feed (2D)', frame)
+            # Run detection in main thread for UI responsiveness
+            # (Note: This runs every frame for UI overlay)
+            current_detections = vision.detect_and_segment(frame)
+            
+            # Render overlays
+            display_frame = ui.render_detections(
+                frame, 
+                current_detections,
+                show_masks=show_masks,
+                show_labels=show_labels,
+                show_bboxes=show_bboxes
+            )
+            
+            # Draw help controls if enabled
+            if show_help:
+                display_frame = ui.draw_controls_help(display_frame)
+            
+            # Draw add-object box if in that mode
+            if ui.mode == "add_object":
+                display_frame = ui.draw_add_object_box(display_frame)
+            
+            cv2.imshow('Object Detection (2D)', display_frame)
 
-            # Non-blocking put
+            # Non-blocking put to processing thread
             if latest_frame_queue.full():
                 try: latest_frame_queue.get_nowait()
                 except queue.Empty: pass
             latest_frame_queue.put(frame)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q') or key == ord('Q'):
                 break
+            elif key == ord('m') or key == ord('M'):
+                show_masks = not show_masks
+                logging.info(f"Masks: {'ON' if show_masks else 'OFF'}")
+            elif key == ord('l') or key == ord('L'):
+                show_labels = not show_labels
+                logging.info(f"Labels: {'ON' if show_labels else 'OFF'}")
+            elif key == ord('b') or key == ord('B'):
+                show_bboxes = not show_bboxes
+                logging.info(f"Bboxes: {'ON' if show_bboxes else 'OFF'}")
+            elif key == ord('h') or key == ord('H'):
+                show_help = not show_help
+            elif key == ord('a') or key == ord('A'):
+                # Accept selected object
+                if ui.selected_object_idx >= 0:
+                    ui.accept_object(ui.selected_object_idx)
+                    logging.info(f"Accepted object {ui.selected_object_idx}")
+            elif key == ord('r') or key == ord('R'):
+                # Reject selected object
+                if ui.selected_object_idx >= 0:
+                    ui.reject_object(ui.selected_object_idx)
+                    logging.info(f"Rejected object {ui.selected_object_idx}")
+            elif key == 9:  # Tab key
+                ui.select_next_object(len(current_detections))
+                logging.info(f"Selected object: {ui.selected_object_idx}")
+            elif key == ord(' '):  # Space
+                if ui.mode == "view":
+                    ui.toggle_mode("add_object")
+                    logging.info("Add object mode: Draw a box around the object")
+                else:
+                    ui.toggle_mode("view")
+                    logging.info("View mode")
+            
+            # Check for user-drawn box in add_object mode
+            drawn_box = ui.get_drawn_box()
+            if drawn_box:
+                logging.info(f"User drew box: {drawn_box}")
+                # Get SAM mask for user-drawn box
+                if vision.sam is not None:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    vision.sam.set_image(rgb_frame)
+                    user_mask = vision.sam.get_mask_from_bbox(drawn_box)
+                    # Add as new detection
+                    current_detections.append((user_mask, "user_object", 1.0, np.array(drawn_box)))
+                    logging.info("Added user-defined object")
+                ui.toggle_mode("view")
+
     finally:
         latest_frame_queue.put(None)
         proc_thread.join()

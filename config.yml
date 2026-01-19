@@ -3,6 +3,8 @@
 # -- Model Paths --
 YOLO_MODEL_PATH: "models/yolov8n.onnx"
 DEPTH_MODEL_PATH: "models/depth_anything_v2_vits.pth"
+SAM_MODEL_PATH: "models/sam_vit_b_01ec64.pth"
+SAM_MODEL_TYPE: "vit_b"
 
 # -- 3D Reconstruction --
 FOCAL_LENGTH: 700
