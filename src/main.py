@@ -71,6 +71,8 @@ class VisionSystem:
         self.cached_shape = None
         self.cached_u = None
         self.cached_v = None
+        self.cached_u_2d = None
+        self.cached_v_2d = None
 
     def load_models(self):
         # Load YOLO
@@ -156,6 +158,8 @@ class VisionSystem:
         if self.cached_grid is None or self.cached_shape != (height, width):
             self.cached_shape = (height, width)
             u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+            self.cached_u_2d = u_coords
+            self.cached_v_2d = v_coords
             self.cached_u = u_coords.flatten()
             self.cached_v = v_coords.flatten()
             self.cached_grid = True 
@@ -194,7 +198,7 @@ class VisionSystem:
         
         return points_3d, colors
 
-    def get_3d_points_masked(self, frame, depth_map, mask, camera_matrix):
+    def get_3d_points_masked(self, frame, depth_map, mask, camera_matrix, bbox=None):
         """
         Converts 2D Image + Depth Map -> 3D Point Cloud (ONLY for masked region)
         
@@ -203,6 +207,7 @@ class VisionSystem:
             depth_map: Depth values for each pixel
             mask: Binary mask (H, W) where True = include pixel
             camera_matrix: Camera intrinsics
+            bbox: Optional (x1, y1, x2, y2) bounding box to restrict processing
             
         Returns:
             points_3d: (N, 3) array of 3D points
@@ -214,16 +219,39 @@ class VisionSystem:
         if self.cached_grid is None or self.cached_shape != (height, width):
             self.cached_shape = (height, width)
             u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+            self.cached_u_2d = u_coords
+            self.cached_v_2d = v_coords
             self.cached_u = u_coords.flatten()
             self.cached_v = v_coords.flatten()
             self.cached_grid = True
 
-        u_flat = self.cached_u
-        v_flat = self.cached_v
-        
-        # Flatten mask and depth
-        mask_flat = mask.flatten()
-        depth_flat = depth_map.flatten()
+        if bbox is not None:
+            x1, y1, x2, y2 = map(int, bbox)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+
+            # Slice arrays to bbox
+            mask_crop = mask[y1:y2, x1:x2]
+            depth_crop = depth_map[y1:y2, x1:x2]
+            u_crop = self.cached_u_2d[y1:y2, x1:x2]
+            v_crop = self.cached_v_2d[y1:y2, x1:x2]
+
+            mask_flat = mask_crop.flatten()
+            depth_flat = depth_crop.flatten()
+            u_flat = u_crop.flatten()
+            v_flat = v_crop.flatten()
+
+            frame_crop = frame[y1:y2, x1:x2]
+            color_flat = frame_crop.reshape(-1, 3)
+        else:
+            u_flat = self.cached_u
+            v_flat = self.cached_v
+
+            # Flatten mask and depth
+            mask_flat = mask.flatten()
+            depth_flat = depth_map.flatten()
+
+            color_flat = frame.reshape(-1, 3)
         
         # Combined validity: inside mask AND valid depth
         valid = mask_flat & (depth_flat > 0)
@@ -247,7 +275,6 @@ class VisionSystem:
         points_3d = np.stack([x_3d, z_3d, y_3d], axis=-1)
         
         # Get Colors
-        color_flat = frame.reshape(-1, 3)
         colors = color_flat[valid]
         colors = colors[:, [2, 1, 0]]  # BGR to RGB
         
@@ -301,7 +328,7 @@ def processing_thread(vision_system, viewer, camera_matrix):
                 if score < 0.5:
                     points_per_detection.append((np.empty((0,3)), np.empty((0,3))))
                     continue
-                pts, cols = vision_system.get_3d_points_masked(frame, depth_map, mask, camera_matrix)
+                pts, cols = vision_system.get_3d_points_masked(frame, depth_map, mask, camera_matrix, bbox=bbox)
                 points_per_detection.append((pts, cols))
             
             # 4. Process through delta fusion
