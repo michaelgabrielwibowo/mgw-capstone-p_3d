@@ -69,6 +69,8 @@ class VisionSystem:
         logging.info(f"Vision system operating on device: {self.device}")
         self.cached_grid = None
         self.cached_shape = None
+        self.cached_u = None
+        self.cached_v = None
 
     def load_models(self):
         # Load YOLO
@@ -208,10 +210,16 @@ class VisionSystem:
         """
         height, width = depth_map.shape
         
-        # Create coordinate grids
-        u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
-        u_flat = u_coords.flatten()
-        v_flat = v_coords.flatten()
+        # Performance optimization: Cache coordinate grids to avoid re-allocation
+        if self.cached_grid is None or self.cached_shape != (height, width):
+            self.cached_shape = (height, width)
+            u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+            self.cached_u = u_coords.flatten()
+            self.cached_v = v_coords.flatten()
+            self.cached_grid = True
+
+        u_flat = self.cached_u
+        v_flat = self.cached_v
         
         # Flatten mask and depth
         mask_flat = mask.flatten()
