@@ -15,6 +15,7 @@ import numpy as np
 import cv2
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
+from collections import Counter
 from enum import Enum
 import logging
 import config
@@ -63,7 +64,7 @@ class SpatialHashGrid:
     
     def hash_point(self, point: np.ndarray) -> Tuple[int, int, int]:
         """Convert a 3D point to its voxel key."""
-        quantized = (point / self.voxel_size).astype(np.int32)
+        quantized = np.floor(point / self.voxel_size).astype(np.int32)
         return (int(quantized[0]), int(quantized[1]), int(quantized[2]))
     
     def get_cell(self, key: Tuple[int, int, int]) -> Optional[VoxelCell]:
@@ -120,6 +121,80 @@ class SpatialHashGrid:
             existing.last_update_frame = frame_id
             existing.is_keyframe = is_keyframe
             existing.observation_count += 1
+
+    def update_cells(self, points: np.ndarray, colors: np.ndarray,
+                     frame_id: int, is_keyframe: bool = False,
+                     blend_mode: BlendMode = BlendMode.NEWEST) -> None:
+        """
+        Vectorized update of voxel cells.
+
+        Args:
+            points: (N, 3) array of new 3D points
+            colors: (N, 3) array of RGB colors
+            frame_id: Current frame number
+            is_keyframe: Whether this is a keyframe update
+            blend_mode: How to handle existing data
+        """
+        if len(points) == 0:
+            return
+
+        # Vectorized hashing: (N, 3) int array
+        keys_arr = np.floor(points / self.voxel_size).astype(np.int32)
+
+        # Convert to tuples for dictionary keys
+        keys_tuples = [tuple(k) for k in keys_arr.tolist()]
+
+        # Calculate counts of how many points land in each voxel
+        # This preserves the observation_count behavior
+        counts = Counter(keys_tuples)
+
+        # For REPLACE/NEWEST: we want the last point for each unique key.
+        # dict(zip(keys, indices)) naturally keeps the last index for each unique key.
+        unique_indices_map = {k: i for i, k in enumerate(keys_tuples)}
+
+        # Pre-allocate numpy arrays to avoid repeated casting inside loop if possible,
+        # but we are storing into objects, so we need to copy anyway.
+
+        for key, idx in unique_indices_map.items():
+            pos = points[idx]
+            col = colors[idx]
+            count_inc = counts[key]
+
+            existing = self.grid.get(key)
+
+            if existing is None:
+                # Create new cell
+                self.grid[key] = VoxelCell(
+                    key=key,
+                    position=pos.astype(np.float32),
+                    color=col.astype(np.uint8),
+                    last_update_frame=frame_id,
+                    is_keyframe=is_keyframe,
+                    observation_count=count_inc
+                )
+            else:
+                # Update existing
+                if blend_mode == BlendMode.REPLACE or is_keyframe:
+                    existing.position[:] = pos
+                    existing.color[:] = col
+                elif blend_mode == BlendMode.NEWEST:
+                     existing.position[:] = pos
+                     existing.color[:] = col
+                elif blend_mode == BlendMode.AVERAGE:
+                    # Partial support for average: fallback to simple average with the NEW point
+                    # (Note: this ignores intermediate points if multiple mapped to same voxel in this batch)
+                    weight = getattr(config, 'TEMPORAL_SMOOTHING_WEIGHT', 0.3)
+                    existing.position = (
+                        (1 - weight) * existing.position + weight * pos
+                    ).astype(np.float32)
+                    existing.color = (
+                        (1 - weight) * existing.color.astype(np.float32) +
+                        weight * col.astype(np.float32)
+                    ).astype(np.uint8)
+
+                existing.last_update_frame = frame_id
+                existing.is_keyframe = is_keyframe
+                existing.observation_count += count_inc
     
     def remove_cell(self, key: Tuple[int, int, int]) -> bool:
         """Remove a cell from the grid. Returns True if cell existed."""
@@ -283,13 +358,11 @@ class DeltaFusionObject:
             for key in cells_to_remove:
                 self.spatial_grid.remove_cell(key)
         
-        # Add all new points
-        for i in range(len(points)):
-            key = self.spatial_grid.hash_point(points[i])
-            self.spatial_grid.update_cell(
-                key, points[i], colors[i], frame_id, 
-                is_keyframe=True, blend_mode=BlendMode.REPLACE
-            )
+        # Add all new points (Vectorized)
+        self.spatial_grid.update_cells(
+            points, colors, frame_id,
+            is_keyframe=True, blend_mode=BlendMode.REPLACE
+        )
     
     def _apply_delta(self, points: np.ndarray, colors: np.ndarray, frame_id: int) -> None:
         """
