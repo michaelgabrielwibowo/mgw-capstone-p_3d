@@ -281,33 +281,19 @@ def processing_thread(vision_system, viewer, camera_matrix):
     start_time = time.time()
     
     # Performance: Skip SAM on some frames (heavy operation)
-    SAM_SKIP_FRAMES = config.SAM_SKIP_FRAMES
     RENDER_SKIP_FRAMES = config.RENDER_SKIP_FRAMES
-    cached_detections = []
-    cached_depth_map = None
+    # Note: detections are now passed from main thread to avoid redundant computation
 
     while True:
         try:
-            frame = latest_frame_queue.get()
-            if frame is None: break
+            data = latest_frame_queue.get()
+            if data is None: break
+            frame, detections = data
             
             frame_count += 1
             
-            # Performance optimization: Only run SAM every N frames
-            run_full_detection = (frame_count % SAM_SKIP_FRAMES == 0) or len(cached_detections) == 0
-            
-            if run_full_detection:
-                # 1. Detect and segment objects (heavy - SAM)
-                detections = vision_system.detect_and_segment(frame)
-                cached_detections = detections
-                
-                # 2. Get depth map
-                depth_map = vision_system.get_depth_map(frame)
-                cached_depth_map = depth_map
-            else:
-                # Use cached detections, but update depth map (it's fast)
-                detections = cached_detections
-                depth_map = vision_system.get_depth_map(frame)
+            # 2. Get depth map (fast enough to run per frame)
+            depth_map = vision_system.get_depth_map(frame)
             
             # 3. Get 3D points for each detected object
             points_per_detection = []
@@ -413,7 +399,7 @@ def main():
             if latest_frame_queue.full():
                 try: latest_frame_queue.get_nowait()
                 except queue.Empty: pass
-            latest_frame_queue.put(frame)
+            latest_frame_queue.put((frame, current_detections))
 
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
