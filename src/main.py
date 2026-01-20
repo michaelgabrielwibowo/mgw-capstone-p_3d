@@ -19,6 +19,7 @@ from delta_fusion import DeltaFusionSystem  # New delta-compression system
 from depth_anything_v2.depth_anything_v2.dpt import DepthAnythingV2
 from sam_segmenter import SAMSegmenter
 from ui_overlay import UIOverlay
+from export_utils import export_ply
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -250,25 +251,30 @@ class VisionSystem:
         
         return points_3d, colors
 
-# Shared queue
+# Shared queue and fusion system
 latest_frame_queue = queue.Queue(maxsize=1)
+shared_fusion_system = None  # Will be set in processing thread
 
 def processing_thread(vision_system, viewer, camera_matrix):
+    global shared_fusion_system
+    
     # Initialize the Delta Fusion System (video-compression-style updates)
     logging.info("Initializing Delta Fusion System (Performance Mode)...")
     fusion_system = DeltaFusionSystem(
-        voxel_size=2.5,           # LARGER = fewer points, faster rendering
-        max_objects=20,           # Reduced for performance
-        expire_after_frames=45,   # Faster object cleanup
-        keyframe_interval=20,     # More responsive keyframes
-        stale_voxel_age=60        # Faster stale voxel cleanup
+        voxel_size=config.VOXEL_SIZE,
+        max_objects=config.MAX_OBJECTS,
+        expire_after_frames=config.EXPIRE_AFTER_FRAMES,
+        keyframe_interval=config.KEYFRAME_INTERVAL,
+        stale_voxel_age=config.STALE_VOXEL_AGE
     )
+    shared_fusion_system = fusion_system  # Make accessible to main thread
     
     frame_count = 0
     start_time = time.time()
     
     # Performance: Skip SAM on some frames (heavy operation)
-    SAM_SKIP_FRAMES = 3  # Run SAM every 3rd frame
+    SAM_SKIP_FRAMES = config.SAM_SKIP_FRAMES
+    RENDER_SKIP_FRAMES = config.RENDER_SKIP_FRAMES
     cached_detections = []
     cached_depth_map = None
 
@@ -310,7 +316,7 @@ def processing_thread(vision_system, viewer, camera_matrix):
             )
             
             # 5. Render 3D view (skip some frames for smoother UI)
-            if len(global_pts) > 0 and frame_count % 2 == 0:  # Render every 2nd frame
+            if len(global_pts) > 0 and frame_count % RENDER_SKIP_FRAMES == 0:
                 viewer.update_and_render(global_pts, global_cols)
             
             # Log performance
@@ -430,6 +436,23 @@ def main():
             elif key == 9:  # Tab key
                 ui.select_next_object(len(current_detections))
                 logging.info(f"Selected object: {ui.selected_object_idx}")
+            elif key == ord('e') or key == ord('E'):
+                # Export point cloud
+                if shared_fusion_system is not None:
+                    pts, cols = shared_fusion_system.get_all_points()
+                    if len(pts) > 0:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"export_{timestamp}.ply"
+                        try:
+                            export_ply(filename, pts, cols)
+                            logging.info(f"✓ Exported {len(pts)} points to {filename}")
+                        except Exception as e:
+                            logging.error(f"Export failed: {e}")
+                    else:
+                        logging.warning("No points to export")
+                else:
+                    logging.warning("Fusion system not ready")
             elif key == ord(' '):  # Space
                 if ui.mode == "view":
                     ui.toggle_mode("add_object")

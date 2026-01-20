@@ -15,3 +15,15 @@ N8N_WEBHOOK_URL: "http://localhost:5678/webhook/vision-detections"
 
 # -- Camera --
 CAMERA_INDEX: 0
+
+# -- Delta Fusion Performance Settings --
+DELTA_FUSION:
+  voxel_size: 2.5
+  max_objects: 20
+  expire_after_frames: 45
+  keyframe_interval: 20
+  stale_voxel_age: 60
+  sam_skip_frames: 3
+  render_skip_frames: 2
+  blend_mode: "average"  # Options: "replace", "average", "newest"
+  temporal_smoothing_weight: 0.3

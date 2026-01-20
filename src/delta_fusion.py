@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
+import config
 
 
 class BlendMode(Enum):
@@ -101,8 +102,8 @@ class SpatialHashGrid:
                 existing.position = position.copy().astype(np.float32)
                 existing.color = color.copy().astype(np.uint8)
             elif blend_mode == BlendMode.AVERAGE:
-                # Weighted average (favor newer observations)
-                weight = 0.7  # Weight for new observation
+                # Weighted average (favor newer observations for temporal smoothing)
+                weight = getattr(config, 'TEMPORAL_SMOOTHING_WEIGHT', 0.3)
                 existing.position = (
                     (1 - weight) * existing.position + weight * position
                 ).astype(np.float32)
@@ -238,14 +239,29 @@ class DeltaFusionObject:
             self.bbox_3d_min = np.minimum(self.bbox_3d_min * 0.9 + pts_min * 0.1, pts_min)
             self.bbox_3d_max = np.maximum(self.bbox_3d_max * 0.9 + pts_max * 0.1, pts_max)
         
-        # Determine if this is a keyframe
+        # Determine if this is a keyframe (adaptive strategy)
         frames_since_keyframe = frame_id - self.last_keyframe_frame
-        is_keyframe = force_keyframe or (frames_since_keyframe >= self.keyframe_interval)
+        time_based_keyframe = frames_since_keyframe >= self.keyframe_interval
+        
+        # Motion-based keyframe: trigger if object moved significantly
+        motion_based_keyframe = False
+        if len(new_points) > 0 and self.bbox_3d_min is not None:
+            old_centroid = (self.bbox_3d_min + self.bbox_3d_max) / 2
+            new_centroid = np.mean(new_points, axis=0)
+            movement = np.linalg.norm(new_centroid - old_centroid)
+            # Trigger keyframe if moved more than 10 voxels
+            motion_threshold = self.spatial_grid.voxel_size * 10
+            motion_based_keyframe = movement > motion_threshold
+            if motion_based_keyframe:
+                logging.debug(f"Object {self.object_id} ({self.label}): Motion keyframe (moved {movement:.1f} units)")
+        
+        is_keyframe = force_keyframe or time_based_keyframe or motion_based_keyframe
         
         if is_keyframe:
             self._apply_keyframe(new_points, new_colors, frame_id)
             self.last_keyframe_frame = frame_id
-            logging.debug(f"Object {self.object_id} ({self.label}): Keyframe applied")
+            keyframe_reason = "forced" if force_keyframe else ("motion" if motion_based_keyframe else "time")
+            logging.debug(f"Object {self.object_id} ({self.label}): Keyframe applied ({keyframe_reason})")
         else:
             self._apply_delta(new_points, new_colors, frame_id)
     
@@ -283,11 +299,12 @@ class DeltaFusionObject:
         - If voxel is empty: Create new cell
         - If voxel exists: Update with blending (favor newer data)
         """
+        # Use AVERAGE blend mode for temporal smoothing (reduces jitter)
         for i in range(len(points)):
             key = self.spatial_grid.hash_point(points[i])
             self.spatial_grid.update_cell(
                 key, points[i], colors[i], frame_id,
-                is_keyframe=False, blend_mode=BlendMode.NEWEST
+                is_keyframe=False, blend_mode=BlendMode.AVERAGE
             )
     
     def cleanup_stale_voxels(self, current_frame: int, max_age: int = 90) -> int:
@@ -406,22 +423,59 @@ class DeltaFusionSystem:
         return inter_area / union_area if union_area > 0 else 0
     
     def _find_matching_object(self, label: str, bbox: np.ndarray,
-                               iou_threshold: float = 0.3) -> Optional[int]:
-        """Find existing object that matches this detection."""
+                               new_points: Optional[np.ndarray] = None,
+                               iou_threshold: float = 0.2) -> Optional[int]:
+        """
+        Find existing object that matches this detection using multi-factor scoring.
+        
+        Args:
+            label: Object class name
+            bbox: 2D bounding box [x1, y1, x2, y2]
+            new_points: Optional 3D points for centroid matching
+            iou_threshold: Minimum combined score threshold
+            
+        Returns:
+            Object ID if match found, None otherwise
+        """
         best_match_id = None
-        best_iou = iou_threshold
+        best_score = iou_threshold
+        
+        # Compute new detection centroid if points provided
+        new_centroid = None
+        if new_points is not None and len(new_points) > 0:
+            new_centroid = np.mean(new_points, axis=0)
         
         for obj_id, obj in self.objects.items():
             # Must be same class
             if obj.label != label:
                 continue
             
-            # Check bbox overlap with last known position
+            # Factor 1: Bbox IoU (2D spatial overlap)
+            iou_score = 0.0
             if obj.bbox_history:
-                iou = self._compute_bbox_iou(bbox, obj.bbox_history[-1])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_match_id = obj_id
+                iou_score = self._compute_bbox_iou(bbox, obj.bbox_history[-1])
+            
+            # Factor 2: Centroid distance (3D proximity)
+            centroid_score = 0.0
+            if new_centroid is not None:
+                obj_centroid = obj.get_centroid()
+                if obj_centroid is not None:
+                    # Distance in world coordinates
+                    dist = np.linalg.norm(new_centroid - obj_centroid)
+                    # Normalize: closer = higher score (exponential decay)
+                    centroid_score = np.exp(-dist / 50.0)  # 50 units = characteristic distance
+            
+            # Combined score: weighted average
+            if new_centroid is not None:
+                # Use both factors
+                combined_score = 0.6 * iou_score + 0.4 * centroid_score
+            else:
+                # Fall back to IoU only
+                combined_score = iou_score
+            
+            if combined_score > best_score:
+                best_score = combined_score
+                best_match_id = obj_id
         
         return best_match_id
     
@@ -469,8 +523,8 @@ class DeltaFusionSystem:
             # Transform to world coordinates
             world_pts = self._transform_points_to_world(pts)
             
-            # Find or create object
-            match_id = self._find_matching_object(label, bbox)
+            # Find or create object (now with centroid distance matching)
+            match_id = self._find_matching_object(label, bbox, world_pts)
             
             if match_id is not None:
                 # Update existing object with delta update
