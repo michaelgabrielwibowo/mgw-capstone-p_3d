@@ -306,6 +306,8 @@ def processing_thread(vision_system, viewer, camera_matrix):
     
     frame_count = 0
     start_time = time.time()
+    last_global_pts = None
+    last_global_cols = None
     
     # Performance: Skip SAM on some frames (heavy operation)
     RENDER_SKIP_FRAMES = config.RENDER_SKIP_FRAMES
@@ -316,8 +318,23 @@ def processing_thread(vision_system, viewer, camera_matrix):
             data = latest_frame_queue.get()
             if data is None: break
             frame, detections = data
+            # Allow main thread to request skipping SAM/processing on some frames
+            # Data may include a skip_value from the trackbar (defaults to 1)
+            skip_value = 1
+            if len(data) >= 3:
+                try:
+                    skip_value = int(data[2])
+                except Exception:
+                    skip_value = 1
             
             frame_count += 1
+
+            skip_value = max(1, int(skip_value))
+            if skip_value > 1 and frame_count % skip_value != 0 and last_global_pts is not None:
+                # Occasionally still render to keep UI responsive
+                if frame_count % RENDER_SKIP_FRAMES == 0 and len(last_global_pts) > 0:
+                    viewer.update_and_render(last_global_pts, last_global_cols)
+                continue
             
             # 2. Get depth map (fast enough to run per frame)
             depth_map = vision_system.get_depth_map(frame)
@@ -335,6 +352,8 @@ def processing_thread(vision_system, viewer, camera_matrix):
             global_pts, global_cols = fusion_system.process_frame(
                 frame, detections, points_per_detection, camera_matrix
             )
+            last_global_pts = global_pts
+            last_global_cols = global_cols
             
             # 5. Render 3D view (skip some frames for smoother UI)
             if len(global_pts) > 0 and frame_count % RENDER_SKIP_FRAMES == 0:
@@ -385,6 +404,7 @@ def main():
     show_bboxes = True
     show_help = True
     current_detections = []
+    frame_index = 0
 
     # Mouse callback for add-object mode
     def mouse_callback(event, x, y, flags, param):
@@ -392,6 +412,19 @@ def main():
     
     cv2.namedWindow('Object Detection (2D)')
     cv2.setMouseCallback('Object Detection (2D)', mouse_callback)
+    skip_default = max(1, int(config.SAM_SKIP_FRAMES))
+    skip_max = max(10, skip_default)
+
+    def on_skip_change(_value):
+        return
+
+    cv2.createTrackbar(
+        'Frame Skip',
+        'Object Detection (2D)',
+        skip_default,
+        skip_max,
+        on_skip_change
+    )
 
     logging.info("Press 'H' for help, 'Q' to quit.")
     try:
@@ -399,9 +432,13 @@ def main():
             ret, frame = cap.read()
             if not ret: break
 
+            frame_index += 1
+            skip_value = max(1, cv2.getTrackbarPos('Frame Skip', 'Object Detection (2D)'))
+
             # Run detection in main thread for UI responsiveness
-            # (Note: This runs every frame for UI overlay)
-            current_detections = vision.detect_and_segment(frame)
+            # Skip SAM/detection on some frames based on trackbar to reduce CPU/GPU load
+            if frame_index % skip_value == 0 or not current_detections:
+                current_detections = vision.detect_and_segment(frame)
             
             # Render overlays
             display_frame = ui.render_detections(
@@ -426,7 +463,7 @@ def main():
             if latest_frame_queue.full():
                 try: latest_frame_queue.get_nowait()
                 except queue.Empty: pass
-            latest_frame_queue.put((frame, current_detections))
+            latest_frame_queue.put((frame, current_detections, skip_value))
 
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF

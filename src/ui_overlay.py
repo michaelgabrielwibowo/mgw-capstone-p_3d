@@ -171,9 +171,11 @@ class UIOverlay:
             "[M] Toggle masks",
             "[L] Toggle labels",
             "[B] Toggle boxes",
+            "[H] Toggle help",
             "[A] Accept selected",
             "[R] Reject selected",
             "[Tab] Next object",
+            "[E] Export",
             "[Space] Add object mode"
         ]
         
